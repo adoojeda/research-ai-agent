@@ -1,7 +1,10 @@
 import os
 import json
+import socket
 import urllib.parse
 import urllib.request
+import urllib.error
+from typing import Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from langchain_anthropic import ChatAnthropic
@@ -51,6 +54,49 @@ def _is_anthropic_credit_error(err: Exception) -> bool:
         and ("too low" in message or "insufficient" in message)
     )
 
+def _is_offline_error(err: Exception) -> bool:
+    if isinstance(err, (socket.gaierror, socket.timeout, TimeoutError)):
+        return True
+
+    if isinstance(err, urllib.error.URLError):
+        reason = getattr(err, "reason", None)
+        if isinstance(reason, (socket.gaierror, socket.timeout, TimeoutError)):
+            return True
+        if isinstance(reason, OSError) and getattr(reason, "errno", None) in {8, -2}:
+            return True
+
+    message = str(err).lower()
+    return any(
+        phrase in message
+        for phrase in (
+            "nodename nor servname provided",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "no address associated with hostname",
+            "max retries exceeded",
+            "failed to establish a new connection",
+        )
+    )
+
+def _prompt_disambiguation_choice(query: str, options: list[tuple[str, str]]) -> Optional[str]:
+    if not options:
+        return None
+
+    print("\nWikipedia encontró una búsqueda ambigua. Elige una opción:")
+    for idx, (title, url) in enumerate(options, start=1):
+        suffix = f" ({url})" if url else ""
+        print(f"{idx}. {title}{suffix}")
+
+    while True:
+        choice = input("Número (Enter para cancelar): ").strip()
+        if choice == "":
+            return None
+        if choice.isdigit():
+            selected = int(choice)
+            if 1 <= selected <= len(options):
+                return options[selected - 1][0]
+        print(f"Opción inválida. Escribe un número entre 1 y {len(options)} o Enter para cancelar.")
+
 def _fallback_wikipedia(query: str) -> ResearchResponse:
     try:
         title = query
@@ -66,16 +112,35 @@ def _fallback_wikipedia(query: str) -> ResearchResponse:
             return json.loads(payload)
 
         data = fetch_json(summary_url)
-        if data.get("type") == "disambiguation":
+        extract_lower = (data.get("extract") or "").lower()
+        is_disambiguation = data.get("type") == "disambiguation" or "may refer to" in extract_lower
+        if is_disambiguation:
             search_url = (
-                "https://en.wikipedia.org/w/api.php?action=opensearch&limit=1&namespace=0&format=json&search="
+                "https://en.wikipedia.org/w/api.php?action=opensearch&limit=5&namespace=0&format=json&search="
                 + urllib.parse.quote(query)
             )
             search_data = fetch_json(search_url)
-            best = (search_data[1][0] if len(search_data) > 1 and search_data[1] else query)
+            titles = (search_data[1] if len(search_data) > 1 else []) or []
+            urls = (search_data[3] if len(search_data) > 3 else []) or []
+            options = list(zip(titles, urls))
+
+            chosen = _prompt_disambiguation_choice(query, options)
+            if chosen is None:
+                disambig_url = (
+                    (data.get("content_urls") or {})
+                    .get("desktop", {})
+                    .get("page", "")
+                )
+                return ResearchResponse(
+                    topic=query,
+                    summary="Consulta ambigua en Wikipedia. No se seleccionó ninguna opción.",
+                    sources=[disambig_url] if disambig_url else [],
+                    tools_used=["wikipedia"],
+                )
+
             data = fetch_json(
                 "https://en.wikipedia.org/api/rest_v1/page/summary/"
-                + urllib.parse.quote(best, safe="")
+                + urllib.parse.quote(chosen, safe="")
             )
 
         title = data.get("title") or query
@@ -87,9 +152,18 @@ def _fallback_wikipedia(query: str) -> ResearchResponse:
         )
         return ResearchResponse(topic=title, summary=summary, sources=[url] if url else [], tools_used=["wikipedia"])
     except Exception as e:
+        if _is_offline_error(e):
+            return ResearchResponse(
+                topic=query,
+                summary=(
+                    "No connection to the internet. Unable to fetch information from Wikipedia. Please check your connection and try again."
+                ),
+                sources=[],
+                tools_used=["wikipedia"],
+            )
         return ResearchResponse(
             topic=query,
-            summary=f"Could not fetch Wikipedia data. Details: {e}",
+            summary="No connection to the internet. Unable to fetch information from Wikipedia. Please check your connection and try again.",
             sources=[],
             tools_used=["wikipedia"],
         )
