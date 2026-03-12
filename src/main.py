@@ -1,9 +1,3 @@
-import os
-import json
-import socket
-import urllib.parse
-import urllib.request
-import urllib.error
 from typing import Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -11,7 +5,15 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain.agents import create_tool_calling_agent, AgentExecutor
-from tools import search_tool, wiki_tool, save_tool, save_to_txt
+from tools import (
+    search_tool,
+    wiki_tool,
+    save_tool,
+    save_to_txt,
+    get_wikipedia_summary,
+    get_topic_output_filename,
+    wikipedia_error_message,
+)
 
 load_dotenv()
 
@@ -21,30 +23,42 @@ class ResearchResponse(BaseModel):
     sources: list[str] = Field(description="List of URLs or references used")
     tools_used: list[str] = Field(description="List of tools the agent decided to use")
     
-llm = ChatAnthropic(model="claude-3-5-sonnet-20241022", temperature=0) 
-parser = PydanticOutputParser(pydantic_object=ResearchResponse)
+_CACHED_AGENT_EXECUTOR: Optional[AgentExecutor] = None
+_CACHED_PARSER: Optional[PydanticOutputParser] = None
 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a professional research assistant. Use the available tools to find accurate information. "
-            "After gathering information, you MUST provide your final answer strictly following this format: \n{format_instructions}"
-        ),
-        ("placeholder", "{chat_history}"),
-        ("human", "{query}"),
-        ("placeholder", "{agent_scratchpad}"),
-    ]
-).partial(format_instructions=parser.get_format_instructions())
+def _get_agent_executor_and_parser() -> tuple[AgentExecutor, PydanticOutputParser]:
+    global _CACHED_AGENT_EXECUTOR, _CACHED_PARSER
+    if _CACHED_AGENT_EXECUTOR is not None and _CACHED_PARSER is not None:
+        return _CACHED_AGENT_EXECUTOR, _CACHED_PARSER
 
-tools = [search_tool, wiki_tool, save_tool]
-agent = create_tool_calling_agent(llm=llm, prompt=prompt, tools=tools)
-agent_executor = AgentExecutor(
-    agent=agent, 
-    tools=tools, 
-    verbose=True,
-    handle_parsing_errors=True 
-)
+    llm = ChatAnthropic(model="claude-3-5-sonnet-20241022", temperature=0)
+    parser = PydanticOutputParser(pydantic_object=ResearchResponse)
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a professional research assistant. Use the available tools to find accurate information. "
+                "After gathering information, you MUST provide your final answer strictly following this format: \n{format_instructions}",
+            ),
+            ("placeholder", "{chat_history}"),
+            ("human", "{query}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ]
+    ).partial(format_instructions=parser.get_format_instructions())
+
+    tools = [search_tool, wiki_tool, save_tool]
+    agent = create_tool_calling_agent(llm=llm, prompt=prompt, tools=tools)
+    agent_executor = AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=True,
+        handle_parsing_errors=True,
+    )
+
+    _CACHED_AGENT_EXECUTOR = agent_executor
+    _CACHED_PARSER = parser
+    return agent_executor, parser
 
 def _is_anthropic_credit_error(err: Exception) -> bool:
     message = str(err).lower()
@@ -54,124 +68,68 @@ def _is_anthropic_credit_error(err: Exception) -> bool:
         and ("too low" in message or "insufficient" in message)
     )
 
-def _is_offline_error(err: Exception) -> bool:
-    if isinstance(err, (socket.gaierror, socket.timeout, TimeoutError)):
-        return True
-
-    if isinstance(err, urllib.error.URLError):
-        reason = getattr(err, "reason", None)
-        if isinstance(reason, (socket.gaierror, socket.timeout, TimeoutError)):
-            return True
-        if isinstance(reason, OSError) and getattr(reason, "errno", None) in {8, -2}:
-            return True
-
-    message = str(err).lower()
-    return any(
-        phrase in message
-        for phrase in (
-            "nodename nor servname provided",
-            "name or service not known",
-            "temporary failure in name resolution",
-            "no address associated with hostname",
-            "max retries exceeded",
-            "failed to establish a new connection",
-        )
-    )
-
 def _prompt_disambiguation_choice(query: str, options: list[tuple[str, str]]) -> Optional[str]:
     if not options:
         return None
 
-    print("\nWikipedia encontró una búsqueda ambigua. Elige una opción:")
+    print("\nWikipedia returned multiple results for your query. Please select the most relevant one:")
     for idx, (title, url) in enumerate(options, start=1):
         suffix = f" ({url})" if url else ""
         print(f"{idx}. {title}{suffix}")
-
     while True:
-        choice = input("Número (Enter para cancelar): ").strip()
+        choice = input("Number (Enter to cancel): ").strip()
         if choice == "":
             return None
         if choice.isdigit():
             selected = int(choice)
             if 1 <= selected <= len(options):
                 return options[selected - 1][0]
-        print(f"Opción inválida. Escribe un número entre 1 y {len(options)} o Enter para cancelar.")
+        print(f"Invalid choice. Please enter a number between 1 and {len(options)}, or press Enter to cancel.")
 
 def _fallback_wikipedia(query: str) -> ResearchResponse:
-    try:
-        title = query
-        summary_url = (
-            "https://en.wikipedia.org/api/rest_v1/page/summary/"
-            + urllib.parse.quote(title, safe="")
-        )
-
-        def fetch_json(url: str) -> dict:
-            req = urllib.request.Request(url, headers={"User-Agent": "research-ai-agent/1.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                payload = resp.read().decode("utf-8")
-            return json.loads(payload)
-
-        data = fetch_json(summary_url)
-        extract_lower = (data.get("extract") or "").lower()
-        is_disambiguation = data.get("type") == "disambiguation" or "may refer to" in extract_lower
-        if is_disambiguation:
-            search_url = (
-                "https://en.wikipedia.org/w/api.php?action=opensearch&limit=5&namespace=0&format=json&search="
-                + urllib.parse.quote(query)
-            )
-            search_data = fetch_json(search_url)
-            titles = (search_data[1] if len(search_data) > 1 else []) or []
-            urls = (search_data[3] if len(search_data) > 3 else []) or []
-            options = list(zip(titles, urls))
-
-            chosen = _prompt_disambiguation_choice(query, options)
-            if chosen is None:
-                disambig_url = (
-                    (data.get("content_urls") or {})
-                    .get("desktop", {})
-                    .get("page", "")
-                )
-                return ResearchResponse(
-                    topic=query,
-                    summary="Consulta ambigua en Wikipedia. No se seleccionó ninguna opción.",
-                    sources=[disambig_url] if disambig_url else [],
-                    tools_used=["wikipedia"],
-                )
-
-            data = fetch_json(
-                "https://en.wikipedia.org/api/rest_v1/page/summary/"
-                + urllib.parse.quote(chosen, safe="")
-            )
-
-        title = data.get("title") or query
-        summary = data.get("extract") or "No summary available."
-        url = (
-            (data.get("content_urls") or {})
-            .get("desktop", {})
-            .get("page", "")
-        )
-        return ResearchResponse(topic=title, summary=summary, sources=[url] if url else [], tools_used=["wikipedia"])
-    except Exception as e:
-        if _is_offline_error(e):
+    current_query = query
+    while True:
+        result = get_wikipedia_summary(current_query, options_limit=5)
+        if not result["ok"]:
             return ResearchResponse(
-                topic=query,
-                summary=(
-                    "No connection to the internet. Unable to fetch information from Wikipedia. Please check your connection and try again."
-                ),
+                topic=current_query,
+                summary=wikipedia_error_message(result),
                 sources=[],
                 tools_used=["wikipedia"],
             )
+
+        if result["is_disambiguation"]:
+            chosen = _prompt_disambiguation_choice(current_query, result["options"])
+            if chosen is None:
+                new_query = input(
+                    "You chose to cancel the disambiguation selection. You can enter a new query to try again, or press Enter to exit: "
+                ).strip()
+                if not new_query:
+                    return ResearchResponse(
+                        topic=current_query,
+                        summary="Consulta ambigua en Wikipedia. No se seleccionó ninguna opción.",
+                        sources=[result["url"]] if result["url"] else [],
+                        tools_used=["wikipedia"],
+                    )
+                current_query = new_query
+                continue
+
+            current_query = chosen
+            continue
+
         return ResearchResponse(
-            topic=query,
-            summary="No connection to the internet. Unable to fetch information from Wikipedia. Please check your connection and try again.",
-            sources=[],
+            topic=result["title"] or current_query,
+            summary=result["summary"],
+            sources=[result["url"]] if result["url"] else [],
             tools_used=["wikipedia"],
         )
 
-def _format_for_save(response: ResearchResponse) -> str:
+def _format_for_save(response: ResearchResponse, *, original_query: str, mode: str) -> str:
     sources = "\n".join(f"- {s}" for s in response.sources) if response.sources else "- (none)"
     tools_used = ", ".join(response.tools_used) if response.tools_used else "(none)"
     return (
+        f"MODE: {mode}\n"
+        f"ORIGINAL_QUERY: {original_query}\n\n"
         f"TOPIC: {response.topic}\n\n"
         f"SUMMARY:\n{response.summary}\n\n"
         f"SOURCES:\n{sources}\n\n"
@@ -185,6 +143,7 @@ def run_research():
         return
 
     try:
+        agent_executor, parser = _get_agent_executor_and_parser()
         raw_response = agent_executor.invoke({"query": query})
         output_text = raw_response.get("output")
 
@@ -194,6 +153,10 @@ def run_research():
         print(f"TOPIC: {structured_response.topic}")
         print(f"SUMMARY: {structured_response.summary}")
         print(f"SOURCES: {', '.join(structured_response.sources)}")
+        save_to_txt(
+            _format_for_save(structured_response, original_query=query, mode="agent"),
+            filename=get_topic_output_filename(structured_response.topic),
+        )
         
     except Exception as e:
         if _is_anthropic_credit_error(e):
@@ -202,7 +165,10 @@ def run_research():
             print(f"TOPIC: {structured_response.topic}")
             print(f"SUMMARY: {structured_response.summary}")
             print(f"SOURCES: {', '.join(structured_response.sources)}")
-            save_to_txt(_format_for_save(structured_response))
+            save_to_txt(
+                _format_for_save(structured_response, original_query=query, mode="fallback"),
+                filename=get_topic_output_filename(structured_response.topic),
+            )
             return
 
         print(f"\n[Error] Could not parse structured response.")
